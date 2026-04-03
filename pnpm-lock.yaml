@@ -14,6 +14,9 @@ importers:
       swagger-ui-dist:
         specifier: ^5.17.14
         version: 5.32.1
+      ws:
+        specifier: ^8.20.0
+        version: 8.20.0
       zca-js:
         specifier: ^2.1.2
         version: 2.1.2

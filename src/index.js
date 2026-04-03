@@ -4,6 +4,7 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import swaggerUiDist from "swagger-ui-dist";
+import { WebSocketServer } from "ws";
 import { ThreadType, Zalo } from "zca-js";
 
 const ECHO_PREFIX = process.env.ECHO_PREFIX ?? "echo: ";
@@ -26,6 +27,8 @@ const SWAGGER_DIST_DIR = swaggerUiDist.getAbsoluteFSPath();
 
 let qrBase64 = null;
 let apiClient = null;
+let wss = null;
+const clients = new Set();
 
 const qrResponseSchema = {
   type: "object",
@@ -56,6 +59,7 @@ const openapiDocument = {
     { name: "Social", description: "好友与社交关系" },
     { name: "Messaging", description: "消息发送与会话动作" },
     { name: "Groups", description: "群组相关" },
+    { name: "WebSocket", description: "实时消息推送" },
   ],
   components: {
     securitySchemes: {
@@ -396,6 +400,22 @@ const openapiDocument = {
         responses: { 200: { description: "成功" }, 400: { description: "参数错误" }, 401: { description: "未授权" }, 503: { description: "未登录" } },
       },
     },
+    "/ws": {
+      get: {
+        tags: ["WebSocket"],
+        summary: "WebSocket 连接端点",
+        description: "用于实时接收消息推送的 WebSocket 连接。连接后，当收到新消息时，会通过 WebSocket 推送消息数据。",
+        responses: {
+          101: {
+            description: "Switching Protocols",
+            headers: {
+              "Upgrade": { description: "websocket", schema: { type: "string" } },
+              "Connection": { description: "Upgrade", schema: { type: "string" } },
+            },
+          },
+        },
+      },
+    },
   },
 };
 
@@ -675,11 +695,32 @@ function startHttpServer() {
     return json(res, 404, { ok: false, message: "Not Found" });
   });
 
+  wss = new WebSocketServer({
+    server,
+    path: "/ws"
+  });
+
+  wss.on("connection", (ws, req) => {
+    clients.add(ws);
+    console.log(`[websocket] 客户端连接，当前连接数: ${clients.size}`);
+
+    ws.on("close", () => {
+      clients.delete(ws);
+      console.log(`[websocket] 客户端断开，当前连接数: ${clients.size}`);
+    });
+
+    ws.on("error", (error) => {
+      console.error("[websocket] 错误:", error);
+      clients.delete(ws);
+    });
+  });
+
   server.listen(HTTP_PORT, () => {
     console.log(`[http] 健康检查: http://localhost:${HTTP_PORT}/health`);
     console.log(`[http] QR接口: http://localhost:${HTTP_PORT}/api/qr`);
     console.log(`[http] OpenAPI: http://localhost:${HTTP_PORT}/openapi.json`);
     console.log(`[http] Swagger UI: http://localhost:${HTTP_PORT}/docs`);
+    console.log(`[http] WebSocket: ws://localhost:${HTTP_PORT}/ws`);
     console.log(`[http] 常用API前缀: http://localhost:${HTTP_PORT}/v1`);
     if (SWAGGER_AUTH_ENABLED) console.log("[http] Swagger 鉴权已启用（Basic Auth）");
     if (API_AUTH_ENABLED) console.log("[http] 业务接口鉴权已启用（Bearer Token）");
@@ -705,6 +746,17 @@ async function bootstrapZalo() {
       if (message.type === ThreadType.User || message.type === ThreadType.Group) {
         await api.sendMessage({ msg: buildReply(content), quote: message.data }, message.threadId, message.type);
       }
+      
+      // 通过 WebSocket 推送消息给所有客户端
+      const wsMessage = JSON.stringify({
+        type: "message",
+        data: message
+      });
+      clients.forEach((client) => {
+        if (client.readyState === 1) {
+          client.send(wsMessage);
+        }
+      });
     } catch (error) {
       console.error("[zca-js] 处理消息失败:", error);
     }
