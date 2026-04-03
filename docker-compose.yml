@@ -7,10 +7,10 @@ services:
     container_name: zca-js-echo
     restart: always
     ports:
-      - "3000:3000"
+      - "9898:9898"
     environment:
       NODE_ENV: production
-      PORT: 3000
+      PORT: 9898
       ECHO_PREFIX: "echo: "
       ONLY_REPLY_PREFIX: ""
     volumes:

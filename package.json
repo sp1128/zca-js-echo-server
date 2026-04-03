@@ -1,6 +1,6 @@
 {
   "name": "zca-js-echo-server",
-  "version": "1.0.0",
+    "version": "1.0.1",
   "description": "Node.js echo bot server based on zca-js",
   "type": "module",
   "main": "src/index.js",
