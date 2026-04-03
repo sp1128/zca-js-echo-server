@@ -1,0 +1,16 @@
+{
+    "name": "zca-js-echo-server",
+    "version": "1.0.0",
+    "description": "Node.js echo bot server based on zca-js",
+    "type": "module",
+    "main": "src/index.js",
+    "scripts": {
+      "start": "node src/index.js",
+      "dev": "node --watch src/index.js"
+    },
+    "dependencies": {
+      "dotenv": "^16.4.5",
+      "swagger-ui-dist": "^5.17.14",
+      "zca-js": "^2.1.2"
+    }
+  }

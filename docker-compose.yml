@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  zca-js-echo:
+    build: .
+    image: zca-js-echo-server:latest
+    container_name: zca-js-echo
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      ECHO_PREFIX: "echo: "
+      ONLY_REPLY_PREFIX: ""
+    volumes:
+      - ./qr.png:/app/qr.png
