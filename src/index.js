@@ -1,16 +1,16 @@
 import "dotenv/config";
 import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import swaggerUiDist from "swagger-ui-dist";
+import { HttpProxyAgent } from "http-proxy-agent";
+import nodeFetch from "node-fetch";
 import { WebSocketServer } from "ws";
-import { ThreadType, Zalo } from "zca-js";
+import { LoginQRCallbackEventType, ThreadType, Zalo } from "zca-js";
 
-const ECHO_PREFIX = process.env.ECHO_PREFIX ?? "echo: ";
-const ONLY_REPLY_PREFIX = process.env.ONLY_REPLY_PREFIX ?? "";
 const HTTP_PORT = Number(process.env.PORT ?? 3000);
-
 const SWAGGER_USERNAME = process.env.SWAGGER_USERNAME ?? "";
 const SWAGGER_PASSWORD = process.env.SWAGGER_PASSWORD ?? "";
 const SWAGGER_AUTH_ENABLED = Boolean(SWAGGER_USERNAME && SWAGGER_PASSWORD);
@@ -22,11 +22,59 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const QR_FILE_PATH = path.resolve(PROJECT_ROOT, "qr.png");
+/** 扫码成功后写入 Cookie + imei，重启后优先走 zalo.login；路径可用环境变量 ZALO_SESSION_FILE 覆盖 */
+const SESSION_FILE_PATH = path.resolve(PROJECT_ROOT, process.env.ZALO_SESSION_FILE ?? "zalo-session.json");
+/** 须与扫码登录时一致；变更会导致 imei 与已存会话不匹配，需重新扫码 */
+const ZALO_USER_AGENT =
+  process.env.ZALO_USER_AGENT ?? "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0";
+const ZALO_LANGUAGE = process.env.ZALO_LANGUAGE ?? "vi";
+/** GET /api/qr 在扫码流程已启动时短暂等待二维码就绪，避免首包早于 QRCodeGenerated 回调（可用环境变量调节） */
+const QR_HTTP_WAIT_MS = Number(process.env.QR_HTTP_WAIT_MS ?? 25_000);
+const QR_HTTP_POLL_MS = Number(process.env.QR_HTTP_POLL_MS ?? 25);
+
+/** 直连时 node-fetch 使用的 socket 超时（毫秒）；避免默认过短。代理路径见 zca-js 文档（HttpProxyAgent + node-fetch） */
+const ZALO_FETCH_CONNECT_TIMEOUT_MS = Number(process.env.ZALO_FETCH_CONNECT_TIMEOUT_MS ?? 60_000);
+/** 可选代理；优先级 ZALO_PROXY > HTTPS_PROXY > HTTP_PROXY。配置后与 zca-js 文档一致：`agent` + `node-fetch` polyfill */
+const ZALO_HTTP_PROXY =
+  process.env.ZALO_PROXY?.trim() || process.env.HTTPS_PROXY?.trim() || process.env.HTTP_PROXY?.trim() || "";
+
+function maskProxyForLog(uri) {
+  try {
+    const u = new URL(uri);
+    if (u.password) u.password = "****";
+    return u.toString();
+  } catch {
+    return "(无效的代理地址)";
+  }
+}
+
+function buildZaloConstructorOptions() {
+  if (ZALO_HTTP_PROXY) {
+    return {
+      agent: new HttpProxyAgent(ZALO_HTTP_PROXY),
+      polyfill: nodeFetch,
+    };
+  }
+  const ms = ZALO_FETCH_CONNECT_TIMEOUT_MS;
+  const httpAgent = new http.Agent({ keepAlive: true, timeout: ms });
+  const httpsAgent = new https.Agent({ keepAlive: true, timeout: ms });
+  return {
+    polyfill: (url, init = {}) =>
+      nodeFetch(url, {
+        ...(init ?? {}),
+        agent: (parsedUrl) => (parsedUrl.protocol === "http:" ? httpAgent : httpsAgent),
+      }),
+  };
+}
+
+const ZALO_CLIENT_OPTIONS = buildZaloConstructorOptions();
 
 const SWAGGER_DIST_DIR = swaggerUiDist.getAbsoluteFSPath();
 
 let qrBase64 = null;
 let apiClient = null;
+/** 首次请求 /api/qr 时启动；失败置空后可再次触发 */
+let zaloBootstrapPromise = null;
 let wss = null;
 const clients = new Set();
 
@@ -34,11 +82,13 @@ const qrResponseSchema = {
   type: "object",
   properties: {
     ok: { type: "boolean", example: true },
+    loggedIn: { type: "boolean", example: false, description: "已为登录态（Cookie 或扫码完成）时可跳过扫码" },
     ready: { type: "boolean", example: true },
     qrPath: { type: "string", example: "./qr.png" },
     mimeType: { type: "string", example: "image/png" },
     base64: { type: ["string", "null"], example: "iVBORw0KGgoAAAANSUhEUgAA..." },
     dataUrl: { type: ["string", "null"], example: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA..." },
+    message: { type: "string", example: "已登录，无需扫码" },
   },
   required: ["ok", "ready", "qrPath", "mimeType", "base64", "dataUrl"],
 };
@@ -94,11 +144,11 @@ const openapiDocument = {
     "/api/qr": {
       get: {
         tags: ["QR"],
-        summary: "获取登录二维码（Base64）",
+        summary: "获取登录二维码（Base64）；优先尝试本地 Cookie，无效时再扫码；首次触发登录",
         security: [{ basicAuth: [] }],
         responses: {
-          200: { description: "二维码已准备好", content: { "application/json": { schema: qrResponseSchema } } },
-          202: { description: "二维码暂未准备好", content: { "application/json": { schema: qrResponseSchema } } },
+          200: { description: "二维码已准备好，或已 Cookie 登录无需二维码", content: { "application/json": { schema: qrResponseSchema } } },
+          202: { description: "二维码暂未准备好（登录流程已启动时可轮询直至 ready）", content: { "application/json": { schema: qrResponseSchema } } },
           401: { description: "未授权" },
         },
       },
@@ -419,17 +469,26 @@ const openapiDocument = {
   },
 };
 
-function shouldReply(content) {
-  if (!ONLY_REPLY_PREFIX) return true;
-  return content.startsWith(ONLY_REPLY_PREFIX);
-}
+function attachZaloMessageListener(api) {
+  console.log("[zca-js] 登录成功，开始监听消息...");
+  api.listener.on("message", async (message) => {
+    console.log(message);
+    try {
+      const wsMessage = JSON.stringify({
+        type: "message",
+        data: message,
+      });
+      clients.forEach((client) => {
+        if (client.readyState === 1) {
+          client.send(wsMessage);
+        }
+      });
+    } catch (error) {
+      console.error("[zca-js] 转发消息到 WebSocket 失败:", error);
+    }
+  });
 
-function buildReply(content) {
-  if (ONLY_REPLY_PREFIX && content.startsWith(ONLY_REPLY_PREFIX)) {
-    const pureContent = content.slice(ONLY_REPLY_PREFIX.length).trimStart();
-    return `${ECHO_PREFIX}${pureContent}`;
-  }
-  return `${ECHO_PREFIX}${content}`;
+  api.listener.start();
 }
 
 function loadQrAsBase64() {
@@ -438,9 +497,125 @@ function loadQrAsBase64() {
   return fileBuffer.toString("base64");
 }
 
+/** 扫码登录成功后删除本地 qr 文件并清空缓存，避免遗留敏感登录入口 */
+function removeLocalQrAfterLogin() {
+  qrBase64 = null;
+  try {
+    if (fs.existsSync(QR_FILE_PATH)) {
+      fs.unlinkSync(QR_FILE_PATH);
+      console.log(`[zca-js] 已删除本地二维码文件: ${QR_FILE_PATH}`);
+    }
+  } catch (err) {
+    console.warn("[zca-js] 删除二维码文件失败:", err?.message ?? err);
+  }
+}
+
+function loadPersistedSession() {
+  try {
+    if (!fs.existsSync(SESSION_FILE_PATH)) return null;
+    const data = JSON.parse(fs.readFileSync(SESSION_FILE_PATH, "utf-8"));
+    if (!data?.imei || !data?.userAgent || !Array.isArray(data?.cookies)) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+/** 将 zca-js 上下文中 CookieJar 序列化写入磁盘，供下次 zalo.login 使用（参见文档 Cookie 登录）。 */
+function persistZaloSession(api) {
+  try {
+    const ctx = api.getContext();
+    const jarJson = ctx.cookie?.toJSON?.();
+    const cookies = jarJson?.cookies;
+    if (!ctx.imei || !ctx.userAgent || !Array.isArray(cookies)) {
+      console.warn("[zca-js] 无法持久化会话：上下文不完整");
+      return;
+    }
+    const payload = {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      imei: ctx.imei,
+      userAgent: ctx.userAgent,
+      language: ctx.language ?? ZALO_LANGUAGE,
+      cookies,
+    };
+    fs.writeFileSync(SESSION_FILE_PATH, JSON.stringify(payload), "utf-8");
+    console.log(`[zca-js] 会话已写入 ${SESSION_FILE_PATH}`);
+  } catch (error) {
+    console.error("[zca-js] 写入会话文件失败:", error);
+  }
+}
+
+async function tryLoginWithSavedSession(zalo) {
+  const saved = loadPersistedSession();
+  if (!saved) return null;
+  try {
+    return await zalo.login({
+      imei: saved.imei,
+      cookie: saved.cookies,
+      userAgent: saved.userAgent,
+      language: saved.language ?? ZALO_LANGUAGE,
+    });
+  } catch (error) {
+    console.warn("[zca-js] 本地 Cookie 登录失败，将尝试扫码:", error?.message ?? error);
+    return null;
+  }
+}
+
+/** 使用回调在二维码生成瞬间写入内存与磁盘，避免仅依赖轮询 qr.png 时出现长时间 ready:false（库在未传 callback 时才会自动写文件）。 */
+function handleLoginQrCallback(event) {
+  if (event.type === LoginQRCallbackEventType.QRCodeGenerated) {
+    qrBase64 = event.data.image ? String(event.data.image) : null;
+    void event.actions.saveToFile(QR_FILE_PATH).catch((err) => {
+      console.error("[zca-js] 保存二维码文件失败:", err);
+    });
+    console.log("[zca-js] 二维码已生成，可通过 /api/qr 获取");
+  } else if (event.type === LoginQRCallbackEventType.QRCodeExpired) {
+    qrBase64 = null;
+  }
+}
+
+/** 不在进程启动时登录；由首次 GET /api/qr 触发：先 Cookie，再 loginQR */
+function startZaloBootstrapIfNeeded() {
+  if (apiClient || zaloBootstrapPromise) return;
+  zaloBootstrapPromise = bootstrapZalo()
+    .then((api) => {
+      apiClient = api;
+      return api;
+    })
+    .catch((err) => {
+      console.error("[zca-js] 登录流程失败:", err);
+    })
+    .finally(() => {
+      if (!apiClient) zaloBootstrapPromise = null;
+    });
+}
+
 function json(res, statusCode, payload) {
   res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(payload));
+}
+
+/** zca-js 走 fetch；连接超时/阻断时给出可操作提示 */
+function mapZaloNetworkFailure(error) {
+  const code = error?.cause?.code ?? error?.code ?? "";
+  const name = error?.cause?.name ?? error?.name ?? "";
+  if (
+    code === "UND_ERR_CONNECT_TIMEOUT" ||
+    code === "UND_ERR_HEADERS_TIMEOUT" ||
+    code === "UND_ERR_SOCKET" ||
+    code === "ETIMEDOUT" ||
+    code === "ECONNRESET" ||
+    code === "ENOTFOUND" ||
+    name === "ConnectTimeoutError"
+  ) {
+    return {
+      status: 503,
+      message:
+        "无法连接 Zalo 接口（超时或网络阻断）。请检查能否访问 chat.zalo.me，必要时配置 VPN；环境变量设置 ZALO_PROXY / HTTPS_PROXY（文档示例：HttpProxyAgent + node-fetch）。直连时可尝试增大 ZALO_FETCH_CONNECT_TIMEOUT_MS。",
+    };
+  }
+  return null;
 }
 
 function unauthorized(res, type = "basic") {
@@ -623,7 +798,7 @@ async function handleCommonApi(req, res, urlObj) {
     const threadId = `${body.threadId ?? ""}`.trim();
     const threadType = getThreadType(body.threadType);
     const msg = `${body.msg ?? ""}`.trim();
-    if (!threadId || !threadType || !msg) return json(res, 400, { ok: false, message: "参数不完整，必须提供 threadId、threadType(user/group)、msg" }), true;
+    if (!threadId || threadType === null || !msg) return json(res, 400, { ok: false, message: "参数不完整，必须提供 threadId、threadType(user/group)、msg" }), true;
     return json(res, 200, { ok: true, data: await apiClient.sendMessage({ msg }, threadId, threadType) }), true;
   }
 
@@ -665,6 +840,18 @@ async function handleCommonApi(req, res, urlObj) {
   return false;
 }
 
+/** 等待二维码生成回调落盘或 Cookie 登录设置 apiClient；登录任务已结束时提前退出 */
+async function awaitQrOrLoginVisible() {
+  const deadline = Date.now() + QR_HTTP_WAIT_MS;
+  while (Date.now() < deadline) {
+    if (apiClient) return;
+    if (qrBase64) return;
+    if (fs.existsSync(QR_FILE_PATH)) return;
+    if (!zaloBootstrapPromise) return;
+    await new Promise((r) => setTimeout(r, QR_HTTP_POLL_MS));
+  }
+}
+
 function startHttpServer() {
   const server = http.createServer(async (req, res) => {
     const urlObj = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -678,17 +865,51 @@ function startHttpServer() {
     }
 
     if (req.method === "GET" && pathname === "/openapi.json") return json(res, 200, openapiDocument);
-    if (req.method === "GET" && pathname === "/health") return json(res, 200, { ok: true, service: "zca-js-echo", loggedIn: Boolean(apiClient) });
+    if (req.method === "GET" && pathname === "/health") {
+      return json(res, 200, {
+        ok: true,
+        service: "zca-js-echo",
+        loggedIn: Boolean(apiClient),
+        loginStarted: Boolean(apiClient || zaloBootstrapPromise),
+        sessionFile: fs.existsSync(SESSION_FILE_PATH),
+      });
+    }
     if (req.method === "GET" && pathname === "/api/qr") {
+      startZaloBootstrapIfNeeded();
+      if (!apiClient && zaloBootstrapPromise) {
+        await awaitQrOrLoginVisible();
+      }
+      if (apiClient) {
+        return json(res, 200, {
+          ok: true,
+          loggedIn: true,
+          ready: true,
+          qrPath: "./qr.png",
+          mimeType: "image/png",
+          base64: null,
+          dataUrl: null,
+          message: "已登录，无需扫码",
+        });
+      }
       const currentBase64 = qrBase64 ?? loadQrAsBase64();
       const ready = Boolean(currentBase64);
-      return json(res, ready ? 200 : 202, { ok: true, ready, qrPath: "./qr.png", mimeType: "image/png", base64: currentBase64, dataUrl: currentBase64 ? `data:image/png;base64,${currentBase64}` : null });
+      return json(res, ready ? 200 : 202, {
+        ok: true,
+        loggedIn: false,
+        ready,
+        qrPath: "./qr.png",
+        mimeType: "image/png",
+        base64: currentBase64,
+        dataUrl: currentBase64 ? `data:image/png;base64,${currentBase64}` : null,
+      });
     }
 
     try {
       if (await handleCommonApi(req, res, urlObj)) return;
     } catch (error) {
       console.error("[http] 接口调用失败:", error);
+      const mapped = mapZaloNetworkFailure(error);
+      if (mapped) return json(res, mapped.status, { ok: false, message: mapped.message });
       return json(res, 500, { ok: false, message: error?.message ?? "Internal Server Error" });
     }
 
@@ -717,58 +938,45 @@ function startHttpServer() {
 
   server.listen(HTTP_PORT, () => {
     console.log(`[http] 健康检查: http://localhost:${HTTP_PORT}/health`);
-    console.log(`[http] QR接口: http://localhost:${HTTP_PORT}/api/qr`);
+    console.log(`[http] QR接口: http://localhost:${HTTP_PORT}/api/qr（首次访问时开始扫码登录）`);
     console.log(`[http] OpenAPI: http://localhost:${HTTP_PORT}/openapi.json`);
     console.log(`[http] Swagger UI: http://localhost:${HTTP_PORT}/docs`);
     console.log(`[http] WebSocket: ws://localhost:${HTTP_PORT}/ws`);
     console.log(`[http] 常用API前缀: http://localhost:${HTTP_PORT}/v1`);
     if (SWAGGER_AUTH_ENABLED) console.log("[http] Swagger 鉴权已启用（Basic Auth）");
     if (API_AUTH_ENABLED) console.log("[http] 业务接口鉴权已启用（Bearer Token）");
+    if (ZALO_HTTP_PROXY) console.log(`[http] Zalo 代理（HttpProxyAgent + node-fetch）: ${maskProxyForLog(ZALO_HTTP_PROXY)}`);
+    else console.log(`[http] Zalo 直连（node-fetch + 内置 Agent），socket 超时: ${ZALO_FETCH_CONNECT_TIMEOUT_MS}ms（ZALO_FETCH_CONNECT_TIMEOUT_MS）`);
   });
 
   return server;
 }
 
 async function bootstrapZalo() {
-  const zalo = new Zalo();
-  const api = await zalo.loginQR({ qrPath: "./qr.png" });
+  const zalo = new Zalo(ZALO_CLIENT_OPTIONS);
+  const qrOptions = { userAgent: ZALO_USER_AGENT, language: ZALO_LANGUAGE };
 
-  qrBase64 = loadQrAsBase64();
-  if (qrBase64) console.log("[zca-js] 检测到 ./qr.png，已转换为 Base64，可通过 /api/qr 获取");
+  let api = await tryLoginWithSavedSession(zalo);
+  if (api) {
+    console.log("[zca-js] 已使用本地会话（Cookie）登录");
+    persistZaloSession(api);
+    attachZaloMessageListener(api);
+    return api;
+  }
 
-  console.log("[zca-js] 登录成功，开始监听消息...");
-  api.listener.on("message", async (message) => {
-    try {
-      const isPlainText = typeof message?.data?.content === "string";
-      if (message?.isSelf || !isPlainText) return;
-      const content = message.data.content.trim();
-      if (!content || !shouldReply(content)) return;
-      if (message.type === ThreadType.User || message.type === ThreadType.Group) {
-        await api.sendMessage({ msg: buildReply(content), quote: message.data }, message.threadId, message.type);
-      }
-      
-      // 通过 WebSocket 推送消息给所有客户端
-      const wsMessage = JSON.stringify({
-        type: "message",
-        data: message
-      });
-      clients.forEach((client) => {
-        if (client.readyState === 1) {
-          client.send(wsMessage);
-        }
-      });
-    } catch (error) {
-      console.error("[zca-js] 处理消息失败:", error);
-    }
-  });
+  console.log("[zca-js] 无有效本地会话，开始扫码登录…");
+  const qrOptionsResolved = { ...qrOptions, qrPath: QR_FILE_PATH };
+  api = await zalo.loginQR(qrOptionsResolved, handleLoginQrCallback);
 
-  api.listener.start();
+  removeLocalQrAfterLogin();
+
+  persistZaloSession(api);
+  attachZaloMessageListener(api);
   return api;
 }
 
 async function main() {
   const server = startHttpServer();
-  apiClient = await bootstrapZalo();
 
   const shutdown = () => {
     try {
